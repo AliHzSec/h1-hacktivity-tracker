@@ -181,7 +181,13 @@ async def fetch_all_new(session: aiohttp.ClientSession, seen_ids: set[str]) -> l
     """
     Paginate through results until a known ID is found.
     Once a known ID is hit, stop — everything after is already seen.
+    On first run (empty log), only fetch the first page to avoid
+    sending thousands of old reports.
     """
+    if not seen_ids:
+        logger.info("First run detected, fetching first page only")
+        return await fetch_page(session, 0)
+
     new_nodes = []
     from_index = 0
     page = 1
