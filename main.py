@@ -1,19 +1,20 @@
 import os
-import time
-import json
 import asyncio
 import aiohttp
 import aiofiles
 from pathlib import Path
 from dotenv import load_dotenv
+from logger import logger
 
 load_dotenv()
+logger.setup(app_name="h1-tracker")
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-LOG_FILE = Path(os.getenv("LOG_FILE", "log.txt"))
+LOG_FILE = Path(os.getenv("LOG_FILE", "data/log.txt"))
 FETCH_DELAY = int(os.getenv("FETCH_DELAY", "5"))  # seconds between posts
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
+PAGE_SIZE = int(os.getenv("PAGE_SIZE", "25"))  # reports per page
 
 # Discord
 DISCORD_ENABLED = os.getenv("DISCORD_ENABLED", "false").lower() == "true"
@@ -98,12 +99,12 @@ SEVERITY_ICONS = {
     "Critical": "🔴 Critical",
 }
 
-SEVERITY_EMOJI = {
-    "None": "⚪",
-    "Low": "🟢",
-    "Medium": "🟡",
-    "High": "🟠",
-    "Critical": "🔴",
+SEVERITY_LABEL = {
+    "None": "Info",
+    "Low": "Low",
+    "Medium": "Medium",
+    "High": "High",
+    "Critical": "Critical",
 }
 
 
@@ -132,6 +133,7 @@ def get_summary(report_generated_content) -> str:
 
 async def load_log() -> set[str]:
     if not LOG_FILE.exists():
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
         LOG_FILE.touch()
         return set()
     async with aiofiles.open(LOG_FILE, "r") as f:
@@ -146,30 +148,69 @@ async def save_id(report_id: str) -> None:
 
 # ─── HackerOne Fetch ───────────────────────────────────────────────────────────
 
+HEADERS = {
+    "accept": "*/*",
+    "cache-control": "no-cache",
+    "content-type": "application/json",
+    "pragma": "no-cache",
+    "x-product-area": "hacktivity",
+    "x-product-feature": "overview",
+    "Referer": "https://hackerone.com/hacktivity/overview",
+    "Referrer-Policy": "origin-when-cross-origin",
+}
 
-async def fetch_hacktivity(session: aiohttp.ClientSession) -> list[dict]:
+
+async def fetch_page(session: aiohttp.ClientSession, from_index: int) -> list[dict]:
     payload = {
         "operationName": "HacktivitySearchQuery",
-        "variables": {"queryString": "disclosed:true", "size": 25, "from": 0, "sort": {"field": "latest_disclosable_activity_at", "direction": "DESC"}},
+        "variables": {
+            "queryString": "disclosed:true",
+            "size": PAGE_SIZE,
+            "from": from_index,
+            "sort": {"field": "latest_disclosable_activity_at", "direction": "DESC"},
+        },
         "query": GRAPHQL_QUERY,
     }
-
-    headers = {
-        "accept": "*/*",
-        "cache-control": "no-cache",
-        "content-type": "application/json",
-        "pragma": "no-cache",
-        "x-product-area": "hacktivity",
-        "x-product-feature": "overview",
-        "Referer": "https://hackerone.com/hacktivity/overview",
-        "Referrer-Policy": "origin-when-cross-origin",
-    }
-
-    async with session.post(HACKERONE_URL, json=payload, headers=headers) as resp:
+    async with session.post(HACKERONE_URL, json=payload, headers=HEADERS) as resp:
         resp.raise_for_status()
         data = await resp.json()
-
     return data["data"]["search"]["nodes"]
+
+
+async def fetch_all_new(session: aiohttp.ClientSession, seen_ids: set[str]) -> list[dict]:
+    """
+    Paginate through results until a known ID is found.
+    Once a known ID is hit, stop — everything after is already seen.
+    """
+    new_nodes = []
+    from_index = 0
+    page = 1
+
+    while True:
+        logger.debug(f"Fetching page {page} (from={from_index})")
+        nodes = await fetch_page(session, from_index)
+
+        if not nodes:
+            logger.debug("Empty page, stopping pagination")
+            break
+
+        found_old = False
+        for node in nodes:
+            report_id = node["report"]["databaseId"]
+            if report_id in seen_ids:
+                found_old = True
+                break
+            new_nodes.append(node)
+
+        if found_old:
+            logger.debug(f"Hit a known ID on page {page}, stopping pagination")
+            break
+
+        logger.debug(f"All {len(nodes)} reports on page {page} are new, fetching next page")
+        from_index += PAGE_SIZE
+        page += 1
+
+    return new_nodes
 
 
 # ─── Discord ───────────────────────────────────────────────────────────────────
@@ -189,7 +230,7 @@ def build_discord_payload(node: dict) -> dict:
 
     color = SEVERITY_COLORS.get(severity, 0xAAAAAA)
 
-    payload = {
+    return {
         "content": f"<@&{DISCORD_ROLE_ID}>" if DISCORD_ROLE_ID else None,
         "embeds": [
             {
@@ -198,15 +239,13 @@ def build_discord_payload(node: dict) -> dict:
                 "url": report["url"],
                 "color": color,
                 "fields": [
-                    {"name": "Severity", "value": SEVERITY_ICONS.get(severity, "— "), "inline": True},
+                    {"name": "Severity", "value": SEVERITY_ICONS.get(severity, "—"), "inline": True},
                     {"name": "Bounty", "value": format_bounty(node.get("total_awarded_amount", 0), team.get("currency", "USD")), "inline": True},
                 ],
             }
         ],
         "attachments": [],
     }
-
-    return payload
 
 
 async def send_discord(session: aiohttp.ClientSession, node: dict) -> bool:
@@ -218,24 +257,24 @@ async def send_discord(session: aiohttp.ClientSession, node: dict) -> bool:
         if resp.status in (200, 204):
             return True
         text = await resp.text()
-        print(f"  [Discord] ❌ HTTP {resp.status}: {text}")
+        logger.error(f"[Discord] HTTP {resp.status}: {text}")
         return False
 
 
 # ─── Main ──────────────────────────────────────────────────────────────────────
 
-
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "300"))
 
 
 async def main():
-    print("─" * 50)
-    print(f"  Discord  : {'✅ enabled' if DISCORD_ENABLED else '❌ disabled'}")
-    print(f"  Interval : {POLL_INTERVAL}s")
-    print("─" * 50)
+    logger.info("-" * 50)
+    logger.info(f"  Discord  : {'enabled' if DISCORD_ENABLED else 'disabled'}")
+    logger.info(f"  Interval : {POLL_INTERVAL}s")
+    logger.info(f"  PageSize : {PAGE_SIZE}")
+    logger.info("-" * 50)
 
     if not DISCORD_ENABLED:
-        print("⚠️  No platform enabled! Set DISCORD_ENABLED=true in .env")
+        logger.warning("No platform enabled. Set DISCORD_ENABLED=true in .env")
         return
 
     timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
@@ -243,36 +282,38 @@ async def main():
     while True:
         try:
             seen_ids = await load_log()
-            print(f"\n🔄 Checking... ({len(seen_ids)} already sent)")
+            logger.info(f"Checking... ({len(seen_ids)} already sent)")
 
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                nodes = await fetch_hacktivity(session)
-                print(f"📦 Got {len(nodes)} reports")
+                new_nodes = await fetch_all_new(session, seen_ids)
 
-                new_count = 0
-                for node in nodes:
-                    report_id = node["report"]["databaseId"]
-                    title = node["report"]["title"]
+                if not new_nodes:
+                    logger.info("No new reports found")
+                else:
+                    logger.info(f"Found {len(new_nodes)} new report(s)")
 
-                    if report_id in seen_ids:
-                        continue
+                    # send oldest first
+                    for node in reversed(new_nodes):
+                        report_id = node["report"]["databaseId"]
+                        title = node["report"]["title"]
+                        severity = node.get("severity_rating", "unknown")
+                        severity_label = SEVERITY_LABEL.get(severity, severity)
 
-                    print(f"  📨 [{report_id}] {title[:60]}...")
-                    discord_ok = await send_discord(session, node)
+                        logger.info(f"Sending [{report_id}] [{severity_label}] {title[:60]}...")
+                        discord_ok = await send_discord(session, node)
 
-                    if discord_ok:
-                        print(f"     ✅ Discord sent")
-                        await save_id(report_id)
-                        seen_ids.add(report_id)
-                        new_count += 1
-                        await asyncio.sleep(FETCH_DELAY)
-
-                print(f"✅ Done — {new_count} new report(s) sent")
+                        if discord_ok:
+                            logger.info(f"Discord sent [{report_id}]")
+                            await save_id(report_id)
+                            seen_ids.add(report_id)
+                            await asyncio.sleep(FETCH_DELAY)
+                        else:
+                            logger.error(f"Failed to send [{report_id}]")
 
         except Exception as e:
-            print(f"❌ Error: {e}")
+            logger.exception(f"Unexpected error: {e}")
 
-        print(f"⏳ Sleeping {POLL_INTERVAL}s...\n")
+        logger.info(f"Sleeping {POLL_INTERVAL}s...")
         await asyncio.sleep(POLL_INTERVAL)
 
 
